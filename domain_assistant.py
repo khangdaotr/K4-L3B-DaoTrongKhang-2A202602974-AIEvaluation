@@ -20,7 +20,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
+import httpx
 from dotenv import load_dotenv
+from google import genai
+from google.genai import types
+from google.genai.errors import APIError as GeminiAPIError
 from openai import OpenAI, OpenAIError
 
 load_dotenv(Path(__file__).resolve().with_name(".env"))
@@ -266,6 +270,60 @@ class OpenAIGenerator:
         return answer
 
 
+class GeminiGenerator:
+    """Generate grounded answers with Google's Gemini API."""
+
+    def __init__(self, max_output_tokens: int = 300) -> None:
+        api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        self.model = os.getenv("GEMINI_MODEL", "").strip()
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY is missing from .env")
+        if not self.model:
+            raise RuntimeError("GEMINI_MODEL is missing from .env")
+        self.client = genai.Client(api_key=api_key)
+        self.max_output_tokens = max_output_tokens
+        self._last_request_at = 0.0
+
+    def generate(self, prompt: str) -> str:
+        response = None
+        for attempt in range(1, 4):
+            try:
+                elapsed = time.monotonic() - self._last_request_at
+                if elapsed < 4.2:
+                    time.sleep(4.2 - elapsed)
+                self._last_request_at = time.monotonic()
+                response = self.client.models.generate_content(
+                    model=self.model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=0,
+                        max_output_tokens=self.max_output_tokens,
+                    ),
+                )
+                break
+            except (GeminiAPIError, httpx.HTTPError) as exc:
+                if attempt == 3:
+                    raise
+                delay = 25 if getattr(exc, "code", None) == 429 else 2**attempt
+                time.sleep(delay)
+
+        if response is None:
+            raise RuntimeError("Gemini request failed without a response")
+        answer = (response.text or "").strip()
+        if not answer:
+            raise RuntimeError("Gemini returned an empty answer")
+        return answer
+
+
+def _default_generator() -> TextGenerator:
+    provider = os.getenv("GENERATION_PROVIDER", "openai").strip().lower()
+    if provider == "gemini":
+        return GeminiGenerator()
+    if provider == "openai":
+        return OpenAIGenerator()
+    raise RuntimeError("GENERATION_PROVIDER must be either 'openai' or 'gemini'")
+
+
 @dataclass(frozen=True)
 class DomainResponse:
     question: str
@@ -299,7 +357,7 @@ class DomainAssistant:
         return cls(
             corpus_id,
             BM25Retriever(chunks),
-            generator if generator is not None else OpenAIGenerator(),
+            generator if generator is not None else _default_generator(),
             top_k,
         )
 
@@ -508,7 +566,15 @@ def main() -> int:
             json.dumps(artifact, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
-    except (OSError, OpenAIError, TypeError, ValueError, RuntimeError) as exc:
+    except (
+        OSError,
+        httpx.HTTPError,
+        OpenAIError,
+        GeminiAPIError,
+        TypeError,
+        ValueError,
+        RuntimeError,
+    ) as exc:
         print(f"ERROR: {exc}")
         return 2
     print(f"Generated {len(artifact['answers'])} actual answers: {output}")
